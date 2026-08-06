@@ -132,52 +132,72 @@ function optionalAuth(req, res, next) {
   next();
 }
 
+// Fixed, transparent nurse payouts per package — separate from partner/referral fees,
+// which come out of DRIPLINE's margin, not the nurse's cut. Nurses always know this
+// number before accepting, regardless of how the booking arrived (referral, membership, direct).
+const NURSE_PAYOUTS = {
+  'Hydration': 65,
+  'Myers Cocktail': 95,
+  "Myers' Cocktail": 95,
+  'Deluxe Myers': 115,
+  "Deluxe Myers'": 115,
+  'Elite All-In': 135,
+  'Vegas Recovery Package': 85,
+  'Solo Membership': 70,
+  'Couples Membership': 110,
+  'Squad Membership': 220,
+};
+const DEFAULT_NURSE_PAYOUT = 80; // fallback for any package not in the table above
+
+function payoutForPackage(pkgLabel) {
+  return NURSE_PAYOUTS[pkgLabel] || DEFAULT_NURSE_PAYOUT;
+}
+
 function requireAdmin(req, res, next) {
   const key = req.headers['x-admin-key'];
   if (key !== ADMIN_KEY) return res.status(401).json({ error: 'Invalid admin key' });
   next();
 }
 
-// Picks the next nurse for a city using simple round-robin (whoever was dispatched longest ago).
-// Real dispatch logic (live location, shift hours, current load) is a natural upgrade path —
-// this is a working MVP, not a full logistics engine.
-function dispatchNurse(booking) {
+// Broadcasts a booking offer to every active nurse in that city, showing the payout
+// upfront — nobody gets auto-assigned. Whoever accepts first (via the nurse portal)
+// gets it, so nurses can browse open offers and pick what fits their schedule,
+// including accepting more than one if their schedule allows.
+function offerBookingToNurses(booking) {
   const nurses = db.getNurses();
-  const eligible = nurses
-    .filter((n) => n.active && n.city === booking.city)
-    .sort((a, b) => (a.lastDispatchedAt || '').localeCompare(b.lastDispatchedAt || ''));
+  const eligible = nurses.filter((n) => n.active && n.city === booking.city);
 
   if (eligible.length === 0) {
     console.warn(`No active nurse available in ${booking.city} for booking ${booking.id}`);
-    return null;
+    return [];
   }
-
-  const nurse = eligible[0];
-  nurse.lastDispatchedAt = new Date().toISOString();
-  db.saveNurses(nurses);
 
   const bookings = db.getBookings();
   const b = bookings.find((x) => x.id === booking.id);
   if (b) {
-    b.nurseId = nurse.id;
-    b.status = 'assigned';
+    b.status = 'offered';
+    b.nursePayout = payoutForPackage(booking.package);
+    b.offeredAt = new Date().toISOString();
+    b.declinedBy = b.declinedBy || [];
     db.saveBookings(bookings);
   }
 
-  const message = `DRIPLINE dispatch: ${booking.package} for ${booking.name} in ${booking.city}. Total paid: $${booking.total}. Check the admin dashboard for address/contact details.`;
+  const payout = b ? b.nursePayout : payoutForPackage(booking.package);
+  const message = `DRIPLINE: New ${booking.package} booking in ${booking.city}. You'd earn $${payout}. Open the nurse portal to accept: ${process.env.NURSE_PORTAL_URL || '(ask your admin for the portal link)'}`;
 
-  const sentFree = sendFreeSms(nurse, message);
+  eligible.forEach((nurse) => {
+    const sentFree = sendFreeSms(nurse, message);
+    if (!sentFree && twilioClient && TWILIO_FROM) {
+      twilioClient.messages
+        .create({ to: nurse.phone, from: TWILIO_FROM, body: message })
+        .then(() => console.log(`Offer SMS sent via Twilio to ${nurse.name} for booking ${booking.id}`))
+        .catch((err) => console.error('Failed to send offer SMS via Twilio:', err.message));
+    } else if (!sentFree) {
+      console.log(`[No SMS method configured] Would have offered ${nurse.name} (${nurse.phone}) booking ${booking.id} for $${payout}`);
+    }
+  });
 
-  if (!sentFree && twilioClient && TWILIO_FROM) {
-    twilioClient.messages
-      .create({ to: nurse.phone, from: TWILIO_FROM, body: message })
-      .then(() => console.log(`Dispatch SMS sent via Twilio to ${nurse.name} for booking ${booking.id}`))
-      .catch((err) => console.error('Failed to send dispatch SMS via Twilio:', err.message));
-  } else if (!sentFree) {
-    console.log(`[No SMS method configured] Would have texted ${nurse.name} (${nurse.phone}) about booking ${booking.id}`);
-  }
-
-  return nurse;
+  return eligible;
 }
 
 // ---------- NURSES (admin only) ----------
@@ -194,7 +214,8 @@ app.post('/nurses', requireAdmin, (req, res) => {
   const nurse = {
     id: 'n_' + Date.now() + '_' + Math.floor(Math.random() * 10000),
     name, phone, city,
-    carrier: carrier || null, // needed for free SMS — e.g. "verizon", "att", "tmobile"
+    carrier: carrier || null,
+    pin: String(Math.floor(1000 + Math.random() * 9000)), // 4-digit PIN for the nurse portal — shown once here, admin should relay it to the nurse
     active: true,
     lastDispatchedAt: null,
     createdAt: new Date().toISOString(),
@@ -215,6 +236,94 @@ app.patch('/nurses/:id', requireAdmin, (req, res) => {
   res.json({ nurse });
 });
 
+// ---------- NURSE PORTAL ----------
+// Lightweight auth for nurses (phone + PIN, no email/password needed) — separate from
+// customer accounts and separate from the admin key.
+
+app.post('/nurse-login', (req, res) => {
+  const { phone, pin } = req.body;
+  if (!phone || !pin) return res.status(400).json({ error: 'phone and pin are required' });
+
+  const nurses = db.getNurses();
+  const nurse = nurses.find((n) => n.phone === phone && n.pin === String(pin));
+  if (!nurse) return res.status(401).json({ error: 'Phone or PIN not recognized' });
+
+  const token = jwt.sign({ nurseId: nurse.id, role: 'nurse' }, JWT_SECRET, { expiresIn: '30d' });
+  res.json({ token, nurse: { id: nurse.id, name: nurse.name, city: nurse.city } });
+});
+
+function requireNurse(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Not logged in' });
+  try {
+    const payload = jwt.verify(header.slice(7), JWT_SECRET);
+    if (payload.role !== 'nurse') throw new Error('wrong role');
+    req.nurseId = payload.nurseId;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid or expired session' });
+  }
+}
+
+// Shows every open offer in the nurse's city they haven't already declined, PLUS
+// their own already-accepted upcoming bookings — so they can browse and pick
+// what fits their schedule rather than being forced into one at a time.
+app.get('/nurse-offers', requireNurse, (req, res) => {
+  const nurses = db.getNurses();
+  const nurse = nurses.find((n) => n.id === req.nurseId);
+  if (!nurse) return res.status(404).json({ error: 'Nurse not found' });
+
+  const bookings = db.getBookings();
+  const openOffers = bookings.filter((b) =>
+    b.status === 'offered' &&
+    b.city === nurse.city &&
+    !(b.declinedBy || []).includes(nurse.id)
+  );
+  const myUpcoming = bookings.filter((b) =>
+    b.nurseId === nurse.id && ['assigned', 'en_route'].includes(b.status)
+  );
+
+  res.json({ openOffers, myUpcoming, nurse: { name: nurse.name, city: nurse.city } });
+});
+
+// First nurse to accept gets it — booking must still be in "offered" status.
+app.post('/nurse-offers/:bookingId/accept', requireNurse, (req, res) => {
+  const bookings = db.getBookings();
+  const booking = bookings.find((b) => b.id === req.params.bookingId);
+  if (!booking) return res.status(404).json({ error: 'Booking not found' });
+  if (booking.status !== 'offered') {
+    return res.status(409).json({ error: 'This booking was already taken by another nurse' });
+  }
+
+  const nurses = db.getNurses();
+  const nurse = nurses.find((n) => n.id === req.nurseId);
+
+  booking.nurseId = req.nurseId;
+  booking.status = 'assigned';
+  booking.acceptedAt = new Date().toISOString();
+  db.saveBookings(bookings);
+
+  if (nurse) {
+    nurse.lastDispatchedAt = new Date().toISOString();
+    db.saveNurses(nurses);
+  }
+
+  res.json({ booking });
+});
+
+// Declining just hides this offer from that nurse — it stays open for everyone else.
+app.post('/nurse-offers/:bookingId/decline', requireNurse, (req, res) => {
+  const bookings = db.getBookings();
+  const booking = bookings.find((b) => b.id === req.params.bookingId);
+  if (!booking) return res.status(404).json({ error: 'Booking not found' });
+
+  booking.declinedBy = booking.declinedBy || [];
+  if (!booking.declinedBy.includes(req.nurseId)) booking.declinedBy.push(req.nurseId);
+  db.saveBookings(bookings);
+
+  res.json({ ok: true });
+});
+
 // ---------- BOOKINGS ADMIN VIEW ----------
 
 app.get('/admin/bookings', requireAdmin, (req, res) => {
@@ -230,6 +339,46 @@ app.patch('/admin/bookings/:id', requireAdmin, (req, res) => {
   if (req.body.status) booking.status = req.body.status;
   db.saveBookings(bookings);
   res.json({ booking });
+});
+
+// ---------- TEXT-TO-SPEECH (real human voice via ElevenLabs) ----------
+// The API key stays server-side here — never expose it in front-end code.
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM'; // "Rachel" — a default ElevenLabs voice
+
+app.post('/tts', async (req, res) => {
+  const { text } = req.body;
+  if (!text) return res.status(400).json({ error: 'text is required' });
+  if (!ELEVENLABS_API_KEY) return res.status(503).json({ error: 'Voice not configured on this server yet' });
+
+  try {
+    const elevenResp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': ELEVENLABS_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'audio/mpeg',
+      },
+      body: JSON.stringify({
+        text,
+        model_id: 'eleven_multilingual_v2', // handles English, Spanish, French, Portuguese, etc. from the same voice
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+      }),
+    });
+
+    if (!elevenResp.ok) {
+      const errText = await elevenResp.text();
+      console.error('ElevenLabs error:', elevenResp.status, errText);
+      return res.status(502).json({ error: 'Voice service failed' });
+    }
+
+    res.set('Content-Type', 'audio/mpeg');
+    const buffer = Buffer.from(await elevenResp.arrayBuffer());
+    res.send(buffer);
+  } catch (err) {
+    console.error('TTS proxy error:', err);
+    res.status(500).json({ error: 'Failed to generate voice' });
+  }
 });
 
 // ---------- STATS (real persistence — replaces the earlier artifact-only storage) ----------
@@ -284,7 +433,7 @@ function markBookingPaid(bookingId) {
     booking.status = 'paid';
     db.saveBookings(bookings);
     incrementStats(booking.total);
-    dispatchNurse(booking); // this is the line that actually texts a nurse
+    offerBookingToNurses(booking); // broadcasts to all eligible nurses in that city, payout shown upfront
   }
   return booking;
 }
