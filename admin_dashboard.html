@@ -25,6 +25,7 @@
   td{ padding:10px; border-bottom:1px solid var(--border);}
   .status{ padding:3px 10px; border-radius:999px; font-size:11px; font-weight:600; text-transform:uppercase;}
   .status.pending{ background:rgba(255,179,71,0.15); color:var(--amber);}
+  .status.offered{ background:rgba(255,77,141,0.15); color:var(--pink);}
   .status.assigned{ background:rgba(63,232,209,0.15); color:var(--accent);}
   .status.paid{ background:rgba(63,232,209,0.15); color:var(--accent);}
   .status.completed{ background:rgba(255,255,255,0.1); color:var(--text);}
@@ -65,24 +66,11 @@
       <select id="nurseCity">
         <option>Las Vegas</option><option>Miami</option><option>Nashville</option>
         <option>Scottsdale</option><option>Austin</option>
-        <option>New York</option><option>Los Angeles</option>
-      </select>
-      <select id="nurseCarrier">
-        <option value="">Carrier (for free SMS)</option>
-        <option value="att">AT&T</option>
-        <option value="verizon">Verizon</option>
-        <option value="tmobile">T-Mobile</option>
-        <option value="sprint">Sprint</option>
-        <option value="boost">Boost Mobile</option>
-        <option value="cricket">Cricket</option>
-        <option value="metropcs">Metro by T-Mobile</option>
-        <option value="uscellular">US Cellular</option>
-        <option value="googlefi">Google Fi</option>
       </select>
       <button class="btn" onclick="addNurse()">Add nurse</button>
     </div>
     <table>
-      <thead><tr><th>Name</th><th>Phone</th><th>City</th><th>Status</th><th>Last dispatched</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Phone</th><th>PIN</th><th>City</th><th>Status</th><th>Last dispatched</th><th></th></tr></thead>
       <tbody id="nurseRows"></tbody>
     </table>
   </section>
@@ -152,6 +140,7 @@
       tr.innerHTML = `
         <td>${n.name}</td>
         <td>${n.phone}</td>
+        <td style="font-family:monospace; color:var(--amber);">${n.pin || '—'}</td>
         <td>${n.city}</td>
         <td><span class="status ${n.active ? 'assigned' : 'completed'}">${n.active ? 'Active' : 'Inactive'}</span></td>
         <td>${n.lastDispatchedAt ? new Date(n.lastDispatchedAt).toLocaleString() : '—'}</td>
@@ -192,10 +181,9 @@
     const name = document.getElementById('nurseName').value.trim();
     const phone = document.getElementById('nursePhone').value.trim();
     const city = document.getElementById('nurseCity').value;
-    const carrier = document.getElementById('nurseCarrier').value;
     if(!name || !phone) return alert('Name and phone are required.');
 
-    await fetch(BACKEND_URL + '/nurses', { method:'POST', headers: headers(), body: JSON.stringify({name, phone, city, carrier}) });
+    await fetch(BACKEND_URL + '/nurses', { method:'POST', headers: headers(), body: JSON.stringify({name, phone, city}) });
     document.getElementById('nurseName').value = '';
     document.getElementById('nursePhone').value = '';
     loadAll();
