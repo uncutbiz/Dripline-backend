@@ -341,40 +341,86 @@ app.patch('/admin/bookings/:id', requireAdmin, (req, res) => {
   res.json({ booking });
 });
 
-// ---------- TEXT-TO-SPEECH (real human voice via ElevenLabs) ----------
-// The API key stays server-side here — never expose it in front-end code.
+// ---------- TEXT-TO-SPEECH (real human voice) ----------
+// Tries Google Cloud TTS first (generous free tier — ~1M characters/month on
+// standard voices), falls back to ElevenLabs if configured, falls back to the
+// browser's built-in voice on the front-end if neither backend option works.
+// API keys stay server-side here — never exposed in front-end code.
+const GOOGLE_TTS_API_KEY = process.env.GOOGLE_TTS_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM'; // "Rachel" — a default ElevenLabs voice
 
+// Google Cloud TTS doesn't officially support Haitian Creole — falls through to
+// English pronunciation of the Creole text if selected, which will sound off.
+// Flagging honestly rather than silently producing bad audio with no explanation.
+const GOOGLE_VOICE_MAP = {
+  en: { languageCode: 'en-US', name: 'en-US-Neural2-F' },
+  es: { languageCode: 'es-US', name: 'es-US-Neural2-A' },
+  fr: { languageCode: 'fr-FR', name: 'fr-FR-Neural2-A' },
+  pt: { languageCode: 'pt-BR', name: 'pt-BR-Neural2-A' },
+  ht: { languageCode: 'en-US', name: 'en-US-Neural2-F' }, // no native Creole voice available — honest fallback
+};
+
+async function synthesizeGoogle(text, lang) {
+  if (!GOOGLE_TTS_API_KEY) return null;
+  const voice = GOOGLE_VOICE_MAP[lang] || GOOGLE_VOICE_MAP.en;
+
+  const resp = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${GOOGLE_TTS_API_KEY}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      input: { text },
+      voice: { languageCode: voice.languageCode, name: voice.name },
+      audioConfig: { audioEncoding: 'MP3' },
+    }),
+  });
+
+  if (!resp.ok) {
+    console.error('Google TTS error:', resp.status, await resp.text());
+    return null;
+  }
+  const data = await resp.json();
+  return Buffer.from(data.audioContent, 'base64'); // Google returns base64-encoded MP3
+}
+
+async function synthesizeElevenLabs(text) {
+  if (!ELEVENLABS_API_KEY) return null;
+
+  const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
+    method: 'POST',
+    headers: {
+      'xi-api-key': ELEVENLABS_API_KEY,
+      'Content-Type': 'application/json',
+      'Accept': 'audio/mpeg',
+    },
+    body: JSON.stringify({
+      text,
+      model_id: 'eleven_multilingual_v2',
+      voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+    }),
+  });
+
+  if (!resp.ok) {
+    console.error('ElevenLabs error:', resp.status, await resp.text());
+    return null;
+  }
+  return Buffer.from(await resp.arrayBuffer());
+}
+
 app.post('/tts', async (req, res) => {
-  const { text } = req.body;
+  const { text, lang } = req.body;
   if (!text) return res.status(400).json({ error: 'text is required' });
-  if (!ELEVENLABS_API_KEY) return res.status(503).json({ error: 'Voice not configured on this server yet' });
 
   try {
-    const elevenResp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
-      method: 'POST',
-      headers: {
-        'xi-api-key': ELEVENLABS_API_KEY,
-        'Content-Type': 'application/json',
-        'Accept': 'audio/mpeg',
-      },
-      body: JSON.stringify({
-        text,
-        model_id: 'eleven_multilingual_v2', // handles English, Spanish, French, Portuguese, etc. from the same voice
-        voice_settings: { stability: 0.5, similarity_boost: 0.75 },
-      }),
-    });
+    let audio = await synthesizeGoogle(text, lang || 'en');
+    if (!audio) audio = await synthesizeElevenLabs(text);
 
-    if (!elevenResp.ok) {
-      const errText = await elevenResp.text();
-      console.error('ElevenLabs error:', elevenResp.status, errText);
-      return res.status(502).json({ error: 'Voice service failed' });
+    if (!audio) {
+      return res.status(503).json({ error: 'No voice provider configured or all providers failed' });
     }
 
     res.set('Content-Type', 'audio/mpeg');
-    const buffer = Buffer.from(await elevenResp.arrayBuffer());
-    res.send(buffer);
+    res.send(audio);
   } catch (err) {
     console.error('TTS proxy error:', err);
     res.status(500).json({ error: 'Failed to generate voice' });
@@ -405,8 +451,25 @@ function incrementStats(amount) {
 // ---------- BOOKINGS ----------
 
 app.post('/bookings', optionalAuth, (req, res) => {
-  const { name, email, phone, city, package: pkg, total, paymentMethod } = req.body;
+  const { name, email, phone, city, package: pkg, total, paymentMethod, referralCode } = req.body;
   if (!name || !total) return res.status(400).json({ error: 'name and total are required' });
+
+  // Look up the partner by code, if one was entered. Invalid/typo'd codes are stored
+  // as-is for later review, but don't block checkout or attach a fee.
+  let partnerId = null;
+  let partnerFeeOwed = 0;
+  if (referralCode) {
+    const partners = db.getPartners();
+    const partner = partners.find(
+      (p) => p.active && p.code.toLowerCase() === String(referralCode).toLowerCase()
+    );
+    if (partner) {
+      partnerId = partner.id;
+      partnerFeeOwed = partner.feeType === 'percent'
+        ? Math.round((total * partner.feeAmount) / 100 * 100) / 100
+        : partner.feeAmount;
+    }
+  }
 
   const bookings = db.getBookings();
   const booking = {
@@ -416,6 +479,10 @@ app.post('/bookings', optionalAuth, (req, res) => {
     package: pkg,
     total,
     paymentMethod: paymentMethod || 'unspecified',
+    referralCode: referralCode || null,
+    partnerId,
+    partnerFeeOwed,
+    partnerFeePaid: false,
     paid: false,
     createdAt: new Date().toISOString(),
   };
@@ -423,6 +490,77 @@ app.post('/bookings', optionalAuth, (req, res) => {
   db.saveBookings(bookings);
 
   res.json({ booking });
+});
+
+// ---------- PARTNERS (admin only) ----------
+
+app.get('/partners', requireAdmin, (req, res) => {
+  const partners = db.getPartners();
+  const bookings = db.getBookings();
+
+  // Attach live totals so the admin dashboard can show exactly what's owed to each partner
+  const withTotals = partners.map((p) => {
+    const theirBookings = bookings.filter((b) => b.partnerId === p.id && b.paid);
+    const totalOwed = theirBookings
+      .filter((b) => !b.partnerFeePaid)
+      .reduce((sum, b) => sum + (b.partnerFeeOwed || 0), 0);
+    const totalPaidOut = theirBookings
+      .filter((b) => b.partnerFeePaid)
+      .reduce((sum, b) => sum + (b.partnerFeeOwed || 0), 0);
+    return { ...p, bookingsSent: theirBookings.length, totalOwed, totalPaidOut };
+  });
+
+  res.json({ partners: withTotals });
+});
+
+app.post('/partners', requireAdmin, (req, res) => {
+  const { name, businessName, code, feeType, feeAmount, city } = req.body;
+  if (!name || !code || !feeAmount) {
+    return res.status(400).json({ error: 'name, code, and feeAmount are required' });
+  }
+
+  const partners = db.getPartners();
+  if (partners.find((p) => p.code.toLowerCase() === code.toLowerCase())) {
+    return res.status(409).json({ error: 'That referral code is already in use' });
+  }
+
+  const partner = {
+    id: 'p_' + Date.now() + '_' + Math.floor(Math.random() * 10000),
+    name,
+    businessName: businessName || '',
+    code: code.toUpperCase(),
+    feeType: feeType === 'percent' ? 'percent' : 'flat', // 'flat' dollar amount or 'percent' of booking total
+    feeAmount: Number(feeAmount),
+    city: city || '',
+    active: true,
+    createdAt: new Date().toISOString(),
+  };
+  partners.push(partner);
+  db.savePartners(partners);
+  res.json({ partner });
+});
+
+app.patch('/partners/:id', requireAdmin, (req, res) => {
+  const partners = db.getPartners();
+  const partner = partners.find((p) => p.id === req.params.id);
+  if (!partner) return res.status(404).json({ error: 'Partner not found' });
+
+  if (typeof req.body.active === 'boolean') partner.active = req.body.active;
+  db.savePartners(partners);
+  res.json({ partner });
+});
+
+// Marks all of a partner's currently-owed fees as paid out — use this after you've
+// actually sent them their money (bank transfer, check, whatever), to reset the running total.
+app.post('/partners/:id/mark-paid', requireAdmin, (req, res) => {
+  const bookings = db.getBookings();
+  bookings.forEach((b) => {
+    if (b.partnerId === req.params.id && b.paid && !b.partnerFeePaid) {
+      b.partnerFeePaid = true;
+    }
+  });
+  db.saveBookings(bookings);
+  res.json({ ok: true });
 });
 
 function markBookingPaid(bookingId) {
