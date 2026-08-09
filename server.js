@@ -17,6 +17,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'change-this-in-production';
 const SUCCESS_URL = process.env.SUCCESS_URL || 'https://your-site.com/booking-confirmed';
 const CANCEL_URL = process.env.CANCEL_URL || 'https://your-site.com/booking-cancelled';
 const ADMIN_KEY = process.env.ADMIN_KEY || 'change-this-admin-key';
+const ADMIN_NOTIFICATION_EMAIL = process.env.ADMIN_NOTIFICATION_EMAIL;
 
 const twilioClient = (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN)
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
@@ -239,6 +240,30 @@ app.patch('/nurses/:id', requireAdmin, (req, res) => {
 // ---------- NURSE PORTAL ----------
 // Lightweight auth for nurses (phone + PIN, no email/password needed) — separate from
 // customer accounts and separate from the admin key.
+
+// Nurse forgot their PIN — generates a new one and sends it via their available
+// notification method (free SMS gateway if carrier is set, otherwise email).
+app.post('/nurse-reset-pin', (req, res) => {
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ error: 'phone is required' });
+
+  const nurses = db.getNurses();
+  const nurse = nurses.find((n) => n.phone === phone);
+  if (nurse) {
+    nurse.pin = String(Math.floor(1000 + Math.random() * 9000));
+    db.saveNurses(nurses);
+
+    const message = `Your new DRIPLINE nurse portal PIN is: ${nurse.pin}`;
+    const sentFree = sendFreeSms(nurse, message);
+    if (!sentFree && nurse.email) sendEmail(nurse.email, 'Your DRIPLINE PIN has been reset', message);
+    if (!sentFree && twilioClient && TWILIO_FROM) {
+      twilioClient.messages.create({ to: nurse.phone, from: TWILIO_FROM, body: message })
+        .catch((err) => console.error('PIN reset SMS via Twilio failed:', err.message));
+    }
+  }
+  // Same "always respond the same way" privacy pattern as the partner reset above.
+  res.json({ ok: true, message: 'If that phone number has a nurse account, a new PIN has been sent.' });
+});
 
 app.post('/nurse-login', (req, res) => {
   const { phone, pin } = req.body;
@@ -551,6 +576,16 @@ app.post('/nurse-applications', (req, res) => {
   };
   apps.push(application);
   db.saveNurseApplications(apps);
+
+  // Notify the admin so applications don't just sit silently unnoticed
+  if (ADMIN_NOTIFICATION_EMAIL) {
+    sendEmail(
+      ADMIN_NOTIFICATION_EMAIL,
+      `New nurse application: ${name}`,
+      `${name} applied to join the provider network.\nPhone: ${phone}\nEmail: ${email || 'not given'}\nCity: ${city}\nAgency: ${agencyName || 'individual, no agency'}\nLicense info: ${licenseInfo || 'not given'}\n\nReview and approve in the admin dashboard.`
+    );
+  }
+
   res.json({ application });
 });
 
@@ -633,6 +668,15 @@ app.post('/partner-applications', (req, res) => {
   };
   apps.push(application);
   db.savePartnerApplications(apps);
+
+  if (ADMIN_NOTIFICATION_EMAIL) {
+    sendEmail(
+      ADMIN_NOTIFICATION_EMAIL,
+      `New partner application: ${name}`,
+      `${name} applied to become a partner.\nBusiness/handle: ${businessName || 'not given'}\nType: ${type || 'other'}\nPlatform: ${platform || 'n/a'} ${followers ? '(' + followers + ' followers)' : ''}\nCity: ${city || 'not given'}\nEmail: ${email}\nPhone: ${phone || 'not given'}\n\nReview and approve in the admin dashboard.`
+    );
+  }
+
   res.json({ application });
 });
 
@@ -703,6 +747,30 @@ app.post('/partner-applications/:id/reject', requireAdmin, (req, res) => {
 });
 
 // ---------- PARTNER LOGIN & SELF-SERVICE DASHBOARD ----------
+
+// Partner forgot their password — generates a new temp one and emails it directly.
+// Simple approach (no reset-link/token flow) since it's low-stakes account access,
+// not something handling stored payment info.
+app.post('/partner-reset-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'email is required' });
+
+  const partners = db.getPartners();
+  const partner = partners.find((p) => p.email && p.email.toLowerCase() === email.toLowerCase());
+  // Always respond the same way whether or not the email matches, so this endpoint
+  // can't be used to check which emails have partner accounts.
+  if (partner) {
+    const newPassword = Math.random().toString(36).slice(-8);
+    partner.passwordHash = await bcrypt.hash(newPassword, 10);
+    db.savePartners(partners);
+    sendEmail(
+      partner.email,
+      'Your DRIPLINE partner password has been reset',
+      `Your new temporary password is: ${newPassword}\n\nLog in and consider changing it if you'd like something more memorable.`
+    );
+  }
+  res.json({ ok: true, message: 'If that email has a partner account, a new password has been sent to it.' });
+});
 
 app.post('/partner-login', async (req, res) => {
   const { email, password } = req.body;
