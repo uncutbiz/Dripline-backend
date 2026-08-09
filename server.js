@@ -715,6 +715,25 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
+// Redundant safety net: the front-end calls this the moment it returns from Stripe,
+// so automatic dispatch doesn't depend ENTIRELY on the webhook being correctly
+// configured in Stripe's dashboard. Whichever path fires first wins — markBookingPaid
+// already guards against double-processing (checks booking.paid before doing anything).
+app.get('/verify-session/:sessionId', async (req, res) => {
+  try {
+    const session = await stripe.checkout.sessions.retrieve(req.params.sessionId);
+    if (session.payment_status === 'paid') {
+      const bookingId = session.metadata && session.metadata.bookingId;
+      if (bookingId) markBookingPaid(bookingId);
+      return res.json({ paid: true });
+    }
+    res.json({ paid: false });
+  } catch (err) {
+    console.error('Session verification error:', err);
+    res.status(500).json({ error: 'Could not verify session' });
+  }
+});
+
 app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
