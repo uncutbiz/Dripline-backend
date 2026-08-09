@@ -324,6 +324,21 @@ app.post('/nurse-offers/:bookingId/decline', requireNurse, (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- CUSTOMER LIST (admin only) ----------
+// Strips passwordHash before sending — that should never leave the server.
+
+app.get('/admin/users', requireAdmin, (req, res) => {
+  const users = db.getUsers().map(({ passwordHash, ...safe }) => safe);
+  res.json({ users: users.sort((a, b) => b.createdAt.localeCompare(a.createdAt)) });
+});
+
+// ---------- REVENUE HISTORY (admin only) ----------
+
+app.get('/admin/stats-history', requireAdmin, (req, res) => {
+  const history = db.getStatsHistory().sort((a, b) => a.date.localeCompare(b.date));
+  res.json({ history: history.slice(-30) }); // last 30 days is plenty for a trend view
+});
+
 // ---------- BOOKINGS ADMIN VIEW ----------
 
 app.get('/admin/bookings', requireAdmin, (req, res) => {
@@ -445,6 +460,18 @@ function incrementStats(amount) {
   current.total += amount;
   current.count += 1;
   db.saveStats(current);
+
+  // Upsert today's entry into permanent history (survives the daily reset above)
+  const history = db.getStatsHistory();
+  const todayEntry = history.find((h) => h.date === current.date);
+  if (todayEntry) {
+    todayEntry.total = current.total;
+    todayEntry.count = current.count;
+  } else {
+    history.push({ date: current.date, total: current.total, count: current.count });
+  }
+  db.saveStatsHistory(history);
+
   return current;
 }
 

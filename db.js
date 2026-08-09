@@ -36,6 +36,9 @@ module.exports = {
   getStats: () => readJSON('stats', { total: 0, count: 0, date: null }),
   saveStats: (stats) => writeJSON('stats', stats),
 
+  getStatsHistory: () => readJSON('stats_history', []),
+  saveStatsHistory: (history) => writeJSON('stats_history', history),
+
   getNurses: () => readJSON('nurses', []),
   saveNurses: (nurses) => writeJSON('nurses', nurses),
 
