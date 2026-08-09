@@ -519,6 +519,96 @@ app.post('/bookings', optionalAuth, (req, res) => {
   res.json({ booking });
 });
 
+function sendEmail(to, subject, text) {
+  if (!emailTransporter || !to) return false;
+  emailTransporter.sendMail({
+    from: process.env.SMS_EMAIL_USER,
+    to,
+    subject,
+    text,
+  }).then(() => console.log(`Email sent to ${to}: ${subject}`))
+    .catch((err) => console.error('Email send failed:', err.message));
+  return true;
+}
+
+// ---------- NURSE / AGENCY APPLICATIONS (public submission, admin review) ----------
+// Same self-serve pattern as partner applications — nurses or agencies representing
+// multiple nurses apply themselves instead of you manually creating every account.
+
+app.post('/nurse-applications', (req, res) => {
+  const { name, phone, email, city, agencyName, licenseInfo, carrier } = req.body;
+  if (!name || !phone || !city) return res.status(400).json({ error: 'name, phone, and city are required' });
+
+  const apps = db.getNurseApplications();
+  const application = {
+    id: 'na_' + Date.now() + '_' + Math.floor(Math.random() * 10000),
+    name, phone, email: email || '', city,
+    agencyName: agencyName || '', // set if applying on behalf of an agency covering multiple nurses
+    licenseInfo: licenseInfo || '', // self-reported; verify before approving — see note in admin flow
+    carrier: carrier || '',
+    status: 'pending',
+    createdAt: new Date().toISOString(),
+  };
+  apps.push(application);
+  db.saveNurseApplications(apps);
+  res.json({ application });
+});
+
+app.get('/nurse-applications', requireAdmin, (req, res) => {
+  const apps = db.getNurseApplications().sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  res.json({ applications: apps });
+});
+
+// Approving creates the real, active nurse account AND automatically notifies them
+// with their login PIN — no manual "go tell them their PIN" step needed anymore.
+app.post('/nurse-applications/:id/approve', requireAdmin, (req, res) => {
+  const apps = db.getNurseApplications();
+  const application = apps.find((a) => a.id === req.params.id);
+  if (!application) return res.status(404).json({ error: 'Application not found' });
+
+  const nurses = db.getNurses();
+  const nurse = {
+    id: 'n_' + Date.now() + '_' + Math.floor(Math.random() * 10000),
+    name: application.name,
+    phone: application.phone,
+    email: application.email,
+    city: application.city,
+    agencyName: application.agencyName,
+    carrier: application.carrier || null,
+    pin: String(Math.floor(1000 + Math.random() * 9000)),
+    active: true,
+    lastDispatchedAt: null,
+    createdAt: new Date().toISOString(),
+  };
+  nurses.push(nurse);
+  db.saveNurses(nurses);
+
+  application.status = 'approved';
+  db.saveNurseApplications(apps);
+
+  const portalUrl = process.env.NURSE_PORTAL_URL || '(ask your admin for the nurse portal link)';
+  const welcomeMessage = `Welcome to DRIPLINE! You're approved to receive bookings in ${nurse.city}. Log into the nurse portal with phone ${nurse.phone} and PIN ${nurse.pin}: ${portalUrl}`;
+
+  sendFreeSms(nurse, welcomeMessage);
+  if (nurse.email) sendEmail(nurse.email, 'Welcome to DRIPLINE — your login PIN', welcomeMessage);
+  if (twilioClient && TWILIO_FROM && !nurse.carrier) {
+    twilioClient.messages.create({ to: nurse.phone, from: TWILIO_FROM, body: welcomeMessage })
+      .catch((err) => console.error('Welcome SMS via Twilio failed:', err.message));
+  }
+
+  res.json({ nurse });
+});
+
+app.post('/nurse-applications/:id/reject', requireAdmin, (req, res) => {
+  const apps = db.getNurseApplications();
+  const application = apps.find((a) => a.id === req.params.id);
+  if (!application) return res.status(404).json({ error: 'Application not found' });
+
+  application.status = 'rejected';
+  db.saveNurseApplications(apps);
+  res.json({ ok: true });
+});
+
 // ---------- PARTNER APPLICATIONS (public submission, admin review) ----------
 // This is the self-serve front door — influencers, hotels, gyms, planners submit
 // themselves instead of you manually creating every partner by hand.
@@ -552,7 +642,7 @@ app.get('/partner-applications', requireAdmin, (req, res) => {
 });
 
 // Approving turns an application into a real, active Partner with an actual referral code and fee.
-app.post('/partner-applications/:id/approve', requireAdmin, (req, res) => {
+app.post('/partner-applications/:id/approve', requireAdmin, async (req, res) => {
   const { code, feeType, feeAmount } = req.body;
   if (!code || !feeAmount) return res.status(400).json({ error: 'code and feeAmount are required to approve' });
 
@@ -565,10 +655,18 @@ app.post('/partner-applications/:id/approve', requireAdmin, (req, res) => {
     return res.status(409).json({ error: 'That referral code is already in use' });
   }
 
+  // Auto-generate a login password so the partner can access their own dashboard —
+  // no manual credential-sharing step needed.
+  const tempPassword = Math.random().toString(36).slice(-8);
+  const passwordHash = await bcrypt.hash(tempPassword, 10);
+
   const partner = {
     id: 'p_' + Date.now() + '_' + Math.floor(Math.random() * 10000),
     name: application.name,
     businessName: application.businessName,
+    email: application.email,
+    passwordHash,
+    payoutEmail: application.email, // defaults to their login email; can be changed later for PayPal payouts
     code: code.toUpperCase(),
     feeType: feeType === 'percent' ? 'percent' : 'flat',
     feeAmount: Number(feeAmount),
@@ -583,7 +681,15 @@ app.post('/partner-applications/:id/approve', requireAdmin, (req, res) => {
   application.status = 'approved';
   db.savePartnerApplications(apps);
 
-  res.json({ partner });
+  const portalUrl = process.env.PARTNER_PORTAL_URL || '(ask your admin for the partner portal link)';
+  sendEmail(
+    partner.email,
+    'Welcome to DRIPLINE Partners — your login details',
+    `You're approved! Your referral code is ${partner.code} (earn $${partner.feeAmount}${partner.feeType === 'percent' ? '%' : ''} per booking).\n\nLog into your partner dashboard here: ${portalUrl}\nEmail: ${partner.email}\nTemporary password: ${tempPassword}\n\nWe'd recommend changing this password after your first login.`
+  );
+
+  const { passwordHash: _hash, ...safePartner } = partner;
+  res.json({ partner: safePartner });
 });
 
 app.post('/partner-applications/:id/reject', requireAdmin, (req, res) => {
@@ -594,6 +700,59 @@ app.post('/partner-applications/:id/reject', requireAdmin, (req, res) => {
   application.status = 'rejected';
   db.savePartnerApplications(apps);
   res.json({ ok: true });
+});
+
+// ---------- PARTNER LOGIN & SELF-SERVICE DASHBOARD ----------
+
+app.post('/partner-login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'email and password are required' });
+
+  const partners = db.getPartners();
+  const partner = partners.find((p) => p.email && p.email.toLowerCase() === email.toLowerCase());
+  if (!partner || !partner.passwordHash) return res.status(401).json({ error: 'Invalid email or password' });
+
+  const match = await bcrypt.compare(password, partner.passwordHash);
+  if (!match) return res.status(401).json({ error: 'Invalid email or password' });
+
+  const token = jwt.sign({ partnerId: partner.id, role: 'partner' }, JWT_SECRET, { expiresIn: '30d' });
+  res.json({ token, partner: { id: partner.id, name: partner.name, code: partner.code } });
+});
+
+function requirePartner(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return res.status(401).json({ error: 'Not logged in' });
+  try {
+    const payload = jwt.verify(header.slice(7), JWT_SECRET);
+    if (payload.role !== 'partner') throw new Error('wrong role');
+    req.partnerId = payload.partnerId;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid or expired session' });
+  }
+}
+
+// A partner's own view of their stats — same numbers admin sees, scoped to just them.
+app.get('/partner/me', requirePartner, (req, res) => {
+  const partners = db.getPartners();
+  const partner = partners.find((p) => p.id === req.partnerId);
+  if (!partner) return res.status(404).json({ error: 'Partner not found' });
+
+  const bookings = db.getBookings();
+  const myBookings = bookings.filter((b) => b.partnerId === partner.id && b.paid);
+  const totalOwed = myBookings.filter((b) => !b.partnerFeePaid).reduce((sum, b) => sum + (b.partnerFeeOwed || 0), 0);
+  const totalPaidOut = myBookings.filter((b) => b.partnerFeePaid).reduce((sum, b) => sum + (b.partnerFeeOwed || 0), 0);
+
+  const { passwordHash, ...safePartner } = partner;
+  res.json({
+    partner: safePartner,
+    bookingsSent: myBookings.length,
+    totalOwed,
+    totalPaidOut,
+    recentBookings: myBookings.slice(-10).reverse().map((b) => ({
+      package: b.package, city: b.city, createdAt: b.createdAt, feeOwed: b.partnerFeeOwed, paid: b.partnerFeePaid,
+    })),
+  });
 });
 
 // ---------- PARTNERS (admin only) ----------
@@ -665,6 +824,57 @@ app.post('/partners/:id/mark-paid', requireAdmin, (req, res) => {
   });
   db.saveBookings(bookings);
   res.json({ ok: true });
+});
+
+// Actually sends real money via PayPal Payouts, instead of just marking the ledger.
+// Requires the partner to have a payoutEmail set (defaults to their login email) and
+// your PayPal app to have Payouts enabled — a separate permission from checkout.
+app.post('/partners/:id/payout-paypal', requireAdmin, async (req, res) => {
+  const partners = db.getPartners();
+  const partner = partners.find((p) => p.id === req.params.id);
+  if (!partner) return res.status(404).json({ error: 'Partner not found' });
+  if (!partner.payoutEmail) return res.status(400).json({ error: 'This partner has no payout email on file' });
+  if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
+    return res.status(500).json({ error: 'PayPal is not configured on this server' });
+  }
+
+  const bookings = db.getBookings();
+  const owedBookings = bookings.filter((b) => b.partnerId === partner.id && b.paid && !b.partnerFeePaid);
+  const totalOwed = owedBookings.reduce((sum, b) => sum + (b.partnerFeeOwed || 0), 0);
+  if (totalOwed <= 0) return res.status(400).json({ error: 'Nothing owed to this partner right now' });
+
+  try {
+    const accessToken = await getPayPalAccessToken();
+    const payoutResp = await fetch(`${PAYPAL_BASE}/v1/payments/payouts`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sender_batch_header: {
+          sender_batch_id: 'dripline_' + Date.now(),
+          email_subject: 'You have a payout from DRIPLINE',
+        },
+        items: [{
+          recipient_type: 'EMAIL',
+          amount: { value: totalOwed.toFixed(2), currency: 'USD' },
+          receiver: partner.payoutEmail,
+          note: `DRIPLINE partner earnings — ${owedBookings.length} booking(s)`,
+        }],
+      }),
+    });
+    const payout = await payoutResp.json();
+    if (!payoutResp.ok) {
+      console.error('PayPal payout error:', payout);
+      return res.status(502).json({ error: 'PayPal payout failed', detail: payout });
+    }
+
+    owedBookings.forEach((b) => { b.partnerFeePaid = true; });
+    db.saveBookings(bookings);
+
+    res.json({ ok: true, amount: totalOwed, payoutBatchId: payout.batch_header && payout.batch_header.payout_batch_id });
+  } catch (err) {
+    console.error('Payout error:', err);
+    res.status(500).json({ error: 'Failed to process payout' });
+  }
 });
 
 function markBookingPaid(bookingId) {
