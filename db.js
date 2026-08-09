@@ -47,4 +47,7 @@ module.exports = {
 
   getPartnerApplications: () => readJSON('partner_applications', []),
   savePartnerApplications: (apps) => writeJSON('partner_applications', apps),
+
+  getNurseApplications: () => readJSON('nurse_applications', []),
+  saveNurseApplications: (apps) => writeJSON('nurse_applications', apps),
 };
