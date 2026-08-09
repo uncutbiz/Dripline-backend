@@ -1112,4 +1112,9 @@ app.post('/capture-paypal-order/:orderId', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`DRIPLINE backend running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`DRIPLINE backend running on port ${PORT}`);
+  if (!process.env.RENDER_DISK_MOUNTED) {
+    console.warn('⚠️  WARNING: No persistent disk detected. All data (users, bookings, nurses, partners) will be LOST on the next deploy or restart unless a Render Disk is attached at /opt/render/project/src/db. Set RENDER_DISK_MOUNTED=true once you\'ve added one, to silence this warning.');
+  }
+});
