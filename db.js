@@ -38,4 +38,10 @@ module.exports = {
 
   getNurses: () => readJSON('nurses', []),
   saveNurses: (nurses) => writeJSON('nurses', nurses),
+
+  getPartners: () => readJSON('partners', []),
+  savePartners: (partners) => writeJSON('partners', partners),
+
+  getPartnerApplications: () => readJSON('partner_applications', []),
+  savePartnerApplications: (apps) => writeJSON('partner_applications', apps),
 };
